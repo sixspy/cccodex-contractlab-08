@@ -21,7 +21,8 @@
   table{width:100%;border-collapse:collapse;font-size:14px}
   th,td{border-bottom:1px solid var(--line);padding:10px 6px;text-align:left;vertical-align:top}
   th{font-size:12px;text-transform:none;color:#6b5b4b}
-  input{width:100%;border:1px solid var(--line);background:#fff;padding:9px 10px;margin:6px 0 12px;border-radius:2px}
+  input,select{width:100%;border:1px solid var(--line);background:#fff;padding:9px 10px;margin:6px 0 12px;border-radius:2px}
+  select{width:auto;min-width:220px;margin:0}
   .primary{background:var(--accent);color:#fff;border:0;padding:10px 14px;cursor:pointer}
   .ghost{background:transparent;border:1px solid var(--ink);padding:7px 10px;cursor:pointer}
   .login{max-width:420px;margin:14vh auto;background:#fffaf2;border:1px solid var(--line);padding:28px}
@@ -30,6 +31,9 @@
   .pair{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   .stamp{display:inline-block;border:1.5px solid var(--ok);color:var(--ok);padding:2px 8px;font-size:12px}
   .stamp.bad{border-color:var(--bad);color:var(--bad)}
+  .scope{display:flex;align-items:center;gap:10px;background:#fffaf2;border:1px solid var(--line);padding:10px 14px;margin-bottom:14px;font-size:14px}
+  .scope b{font-weight:600}
+  .pill{display:inline-block;border:1px solid var(--accent);color:var(--accent);padding:1px 8px;font-size:12px;margin-left:6px}
 </style>
 </head>
 <body>
@@ -46,16 +50,29 @@ setTimeout(function () {
 </script>
 
 <script>
-const {createApp,ref,onMounted}=Vue;
+const {createApp,ref,computed,onMounted}=Vue;
 createApp({
   setup(){
     const token=ref(localStorage.getItem('contractlab_token')||'');
     const user=ref(localStorage.getItem('contractlab_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
     const contracts=ref([]), batches=ref([]), buffers=ref([]), recon=ref({});
+    const ledger=ref({}), contentions=ref([]);
     const form=ref({subject:'订单入站', payload_fields:'order_id,amount'});
+    const scopeSubject=ref('');  // 主题隔离下拉：空=全量，非空=按主题加条件
     const nav=['契约版本','入站校验','双写缓冲','契约对账'];
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
+    function q(url){
+      const u=new URL(url, location.origin);
+      if(scopeSubject.value) u.searchParams.set('subject', scopeSubject.value);
+      return u.pathname+u.search;
+    }
+    const subjects=computed(()=>{
+      const s=new Set();
+      contracts.value.forEach(c=>s.add(c.subject));
+      batches.value.forEach(b=>s.add(b.subject));
+      return Array.from(s).sort();
+    });
     async function login(){
       err.value='';
       const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:username.value,password:password.value})});
@@ -73,23 +90,30 @@ createApp({
     }
     async function refresh(){
       if(!token.value) return;
-      const c=await loadJson('/api/contracts'); if(c===null) return;
+      // 下拉联动的是查询条件（后端 subject 过滤），不是前端只改展示
+      const c=await loadJson(q('/api/contracts')); if(c===null) return;
       contracts.value=Array.isArray(c.items)?c.items:[];
-      const b=await loadJson('/api/ingress'); if(b===null) return;
+      const b=await loadJson(q('/api/ingress')); if(b===null) return;
       batches.value=Array.isArray(b.items)?b.items:[];
-      const u=await loadJson('/api/buffers'); if(u===null) return;
+      const u=await loadJson(q('/api/buffers')); if(u===null) return;
       buffers.value=Array.isArray(u.items)?u.items:[];
-      const q=await loadJson('/api/reconcile'); if(q===null) return;
-      recon.value=q&&typeof q==='object'?q:{};
+      const rq=await loadJson(q('/api/reconcile')); if(rq===null) return;
+      recon.value=rq&&typeof rq==='object'?rq:{};
+      const lg=await loadJson('/api/isolation/ledger');
+      ledger.value=lg&&typeof lg==='object'?lg:{};
+      const ct=await loadJson(q('/api/contentions'));
+      contentions.value=ct&&Array.isArray(ct.items)?ct.items:[];
     }
     async function validate(){
       actionErr.value='';
       const r=await fetch('/api/ingress/validate',{method:'POST',headers:auth(),body:JSON.stringify(form.value)});
-      const j=await r.json(); actionErr.value=r.ok?('校验结果：'+j.result+(j.missing?('；缺 '+j.missing.join(',')):'')):(j.detail||'失败');
+      const j=await r.json();
+      actionErr.value=r.ok?('校验结果：'+j.result+(j.missing?('；缺 '+j.missing.join(',')):'')):(j.detail||'失败');
       await refresh();
     }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,form,actionErr,login,logout,validate};
+    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,ledger,contentions,
+      form,actionErr,scopeSubject,subjects,login,logout,validate,refresh};
   },
   template:`
   <div v-if="!token" class="login">
@@ -107,8 +131,19 @@ createApp({
       <div class="meta">{{user}} · 本地 SQLite<br/><button class="ghost" style="margin-top:8px" @click="logout">退出</button></div>
     </header>
     <div class="steps"><button v-for="(n,i) in nav" :key="n" :class="{on:tab===i}" @click="tab=i">{{i+1}}. {{n}}</button></div>
+
+    <div class="scope">
+      <b>主题隔离</b>
+      <select v-model="scopeSubject" @change="refresh">
+        <option value="">全主题（不带条件）</option>
+        <option v-for="s in subjects" :key="s" :value="s">{{s}}</option>
+      </select>
+      <span class="meta">下拉切换即向后端带 subject 条件重查，目录/列表/缓冲/账册/附页同口径，不串题</span>
+      <span class="pill" v-if="ledger.approach">{{ledger.approach}} · 已落定不许换</span>
+    </div>
+
     <div class="card" v-show="tab===0">
-      <h2>现行契约</h2>
+      <h2>现行契约 <span class="meta" v-if="scopeSubject">（仅主题：{{scopeSubject}}）</span></h2>
       <table><thead><tr><th>版本</th><th>主题</th><th>模式 / 轨</th><th>状态</th><th>必填字段</th></tr></thead>
       <tbody><tr v-for="c in contracts" :key="c.id">
         <td>{{c.version}}</td><td>{{c.subject}}</td><td>{{c.mode}} / {{c.track}}</td><td>{{c.status}}</td><td>{{c.required_fields}}</td>
@@ -117,13 +152,16 @@ createApp({
     <div class="pair" v-show="tab===1">
       <div class="card">
         <h2>提交入站</h2>
-        <label>主题</label><input v-model="form.subject"/>
+        <label>主题</label>
+        <select v-model="form.subject">
+          <option v-for="s in subjects" :key="s" :value="s">{{s}}</option>
+        </select>
         <label>载荷字段</label><input v-model="form.payload_fields"/>
         <button class="primary" @click="validate">按正式契约校验</button>
         <div class="err">{{actionErr}}</div>
       </div>
       <div class="card">
-        <h2>最近批次</h2>
+        <h2>最近批次 <span class="meta" v-if="scopeSubject">（仅主题：{{scopeSubject}}）</span></h2>
         <table><thead><tr><th>批次</th><th>结果</th><th>说明</th></tr></thead>
         <tbody><tr v-for="b in (batches||[]).slice(0,8)" :key="b.id">
           <td>#{{b.id}} {{b.subject}}</td>
@@ -133,13 +171,21 @@ createApp({
       </div>
     </div>
     <div class="card" v-show="tab===2">
-      <h2>双写缓冲</h2>
+      <h2>双写缓冲 <span class="meta" v-if="scopeSubject">（仅主题：{{scopeSubject}}）</span></h2>
       <table><thead><tr><th>缓冲</th><th>批次</th><th>主题</th><th>原因</th></tr></thead>
       <tbody><tr v-for="b in buffers" :key="b.id"><td>{{b.id}}</td><td>{{b.batch_id}}</td><td>{{b.subject}}</td><td>{{b.reason}}</td></tr></tbody></table>
     </div>
     <div class="card" v-show="tab===3">
-      <h2>契约对账摘要</h2>
-      <p>入站 {{recon.ingress_total}} · 通过 {{recon.passed}} · 缓冲 {{recon.buffered}} · 拒收 {{recon.rejected}} · 缓冲行 {{recon.buffer_rows}} · 对齐 {{recon.aligned}}</p>
+      <h2>契约对账摘要 <span class="meta" v-if="scopeSubject">（仅主题：{{scopeSubject}}）</span></h2>
+      <p>入站 {{recon.ingress_total}} · 通过 {{recon.passed}} · 缓冲 {{recon.buffered}} · 拒收 {{recon.rejected}} · 缓冲行 {{recon.buffer_rows}} · 争用登记 {{recon.contention_rows}} · 对齐 {{recon.aligned}}</p>
+      <h2 style="margin-top:14px">主题隔离簿</h2>
+      <p class="meta">口径：<b>{{ledger.approach}}</b> · 落定时间：{{ledger.chosen_at}} · 落定方：{{ledger.chosen_by}} · 当天不许换、两径不得混用</p>
+      <h2 style="margin-top:14px">主题争用 / 口径偏离附页</h2>
+      <table><thead><tr><th>登记</th><th>主题</th><th>契约</th><th>类别</th><th>说明</th><th>时间</th></tr></thead>
+      <tbody><tr v-for="t in contentions" :key="t.id">
+        <td>#{{t.id}}</td><td>{{t.subject}}</td><td>{{t.contract_version||'—'}}</td><td>{{t.kind}}</td><td>{{t.detail}}</td><td>{{t.created_at}}</td>
+      </tr>
+      <tr v-if="!contentions.length"><td colspan="6" class="meta">暂无争用/偏离登记</td></tr></tbody></table>
     </div>
   </div>`
 }).mount('#app');
